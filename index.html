@@ -81,6 +81,7 @@
   <button id="pl" disabled>▶ Play</button>
   <button id="st" disabled>■ Stop</button>
   <button id="sv" disabled>💾 WAV</button>
+  <button id="sm" disabled>💾 MIDI</button>
 </div>
 
 <canvas id="cv" width="1280" height="440"></canvas>
@@ -299,14 +300,14 @@ class SN{
   }
 }
 
-let cb=null,mb=null,tok=0;
+let cb=null,mb=null,tok=0,rendEvts=null,rendDur=0;
 async function renderAsync(evts,dur){
   const t0=++tok;
   const sn=new SN();
   const N=Math.ceil((dur+.5)*SR);
   const b=new Float32Array(N);
   const c=[new Float32Array(N),new Float32Array(N),new Float32Array(N),new Float32Array(N)];
-  cb=c;mb=b;
+  cb=c;mb=b;rendEvts=evts;rendDur=dur;
   let ei=0;const chunk=Math.floor(SR*.15);
   for(let s=0;s<N;s+=chunk){
     if(tok!==t0)return null;
@@ -337,6 +338,110 @@ function toWav(b){
   w16(1);w16(1);w32(SR);w32(SR*2);w16(2);w16(16);ws('data');w32(N*2);
   for(let i=0;i<N;i++){const s=Math.max(-1,Math.min(1,b[i]));v.setInt16(p,s*32767,true);p+=2}
   return new Blob([ab],{type:'audio/wav'});
+}
+
+function eventsToMidi(evts,dur){
+  const TPQ=480,BPM=120,ticksPerS=TPQ*BPM/60;
+  const pToM=p=>{if(!p||p<1)return 60;const f=CLOCK/32/p;return Math.max(0,Math.min(127,Math.round(69+12*Math.log2(f/440))))};
+  const trks=[[],[],[]];
+  const dTrk=[];
+  const lastN=[0,0,0],lastT=[0,0,0,0],lastV=[15,15,15,15];
+  for(const e of evts){
+    if(e.type==='tone'){
+      const ch=e.ch;
+      if(ch>=0&&ch<3){
+        const t=e.t,n=pToM(e.period);
+        if(lastV[ch]<15&&lastN[ch]>0){
+          const dt=Math.max(0,Math.round((t-lastT[ch])*ticksPerS));
+          trks[ch].push({dt,cmd:0x80,n:lastN[ch],vel:0});
+        }
+        lastN[ch]=n;lastT[ch]=t;
+        if(lastV[ch]<15){
+          trks[ch].push({dt:0,cmd:0x90,n,vel:Math.max(1,Math.round((15-lastV[ch])/14*127))});
+        }
+      }
+    }else if(e.type==='vol'){
+      const ch=e.ch,v=e.vol,t=e.t;
+      if(ch>=0&&ch<3){
+        if(v<15&&lastV[ch]>=15&&lastN[ch]>0){
+          const dt=Math.max(0,Math.round((t-lastT[ch])*ticksPerS));
+          trks[ch].push({dt,cmd:0x90,n:lastN[ch],vel:Math.max(1,Math.round((15-v)/14*127))});
+          lastT[ch]=t;
+        }else if(v>=15&&lastV[ch]<15&&lastN[ch]>0){
+          const dt=Math.max(0,Math.round((t-lastT[ch])*ticksPerS));
+          trks[ch].push({dt,cmd:0x80,n:lastN[ch],vel:0});
+          lastT[ch]=t;
+        }
+        lastV[ch]=v;
+      }else if(ch===3){
+        if(v<15&&lastV[ch]>=15){
+          const dt=Math.max(0,Math.round((t-lastT[ch])*ticksPerS));
+          dTrk.push({dt,cmd:0x90,n:42,vel:Math.max(1,Math.round((15-v)/14*127))});
+          lastT[ch]=t;
+        }else if(v>=15&&lastV[ch]<15){
+          const dt=Math.max(0,Math.round((t-lastT[ch])*ticksPerS));
+          dTrk.push({dt,cmd:0x80,n:42,vel:0});
+          lastT[ch]=t;
+        }
+        lastV[ch]=v;
+      }
+    }
+  }
+  for(let ch=0;ch<3;ch++){
+    if(lastV[ch]<15&&lastN[ch]>0){
+      const dt=Math.round((dur-lastT[ch])*ticksPerS);
+      trks[ch].push({dt,cmd:0x80,n:lastN[ch],vel:0});
+    }
+  }
+  if(lastV[3]<15){
+    const dt=Math.round((dur-lastT[3])*ticksPerS);
+    dTrk.push({dt,cmd:0x80,n:42,vel:0});
+  }
+  const wV=v=>{const b=[];if(v===0)return[0];if(v<128)return[v];let x=v;while(x>0){b.unshift((x&0x7F)|(b.length?0x80:0));x>>=7}return b};
+  const tSz=[];let sz=14;
+  for(let i=0;i<3;i++){
+    let ts=0;
+    for(const e of trks[i]){
+      const vb=wV(e.dt);
+      ts+=vb.length+3;
+    }
+    ts+=4;
+    tSz.push(ts);
+    sz+=ts+8;
+  }
+  let dts=0;
+  for(const e of dTrk){
+    const vb=wV(e.dt);
+    dts+=vb.length+3;
+  }
+  dts+=4;
+  tSz.push(dts);
+  sz+=dts+8;
+  const buf=new ArrayBuffer(sz);
+  const d=new Uint8Array(buf),v=new DataView(buf);
+  let p=0;
+  const wS=s=>{for(const c of s)d[p++]=c.charCodeAt(0)};
+  const w32=x=>{v.setUint32(p,x);p+=4};
+  const w16=x=>{v.setUint16(p,x);p+=2};
+  const w8=x=>d[p++]=x;
+  wS('MThd');w32(6);w16(1);w16(4);w16(TPQ);
+  for(let i=0;i<3;i++){
+    wS('MTrk');w32(tSz[i]);
+    for(const e of trks[i]){
+      const vb=wV(e.dt);
+      for(const x of vb)w8(x);
+      w8(e.cmd|i);w8(e.n);w8(e.vel);
+    }
+    w8(0);w8(0xFF);w8(0x2F);w8(0);
+  }
+  wS('MTrk');w32(tSz[3]);
+  for(const e of dTrk){
+    const vb=wV(e.dt);
+    for(const x of vb)w8(x);
+    w8(e.cmd|9);w8(e.n);w8(e.vel);
+  }
+  w8(0);w8(0xFF);w8(0x2F);w8(0);
+  return new Blob([buf],{type:'audio/midi'});
 }
 
 let mData=null,vEvts=null,vDur=0,aBuf=null,src=null,ctx=null,pS=0,pl=false,srcType=null;
@@ -397,7 +502,7 @@ $('file').addEventListener('change',async e=>{
   const f=e.target.files[0];if(!f)return;
   try{
     let ab=await f.arrayBuffer();
-    mData=null;vEvts=null;cb=null;mb=null;
+    mData=null;vEvts=null;cb=null;mb=null;rendEvts=null;
     const h=new Uint8Array(ab,0,Math.min(4,ab.byteLength));
     const gz=h[0]===0x1F&&h[1]===0x8B;
     const md=h[0]===0x4D&&h[1]===0x54&&h[2]===0x68&&h[3]===0x64;
@@ -439,7 +544,7 @@ async function doRender(){
   if(!ctx)ctx=new AudioContext({sampleRate:SR});
   aBuf=ctx.createBuffer(1,b.length,SR);aBuf.copyToChannel(b,0);
   log(`Ready · ${ms}ms · ${evts.length} events · ${srcType.toUpperCase()}`);
-  $('pl').disabled=false;$('sv').disabled=false;
+  $('pl').disabled=false;$('sv').disabled=false;$('sm').disabled=false;
 }
 
 $('ren').addEventListener('click',doRender);
@@ -463,6 +568,15 @@ $('sv').addEventListener('click',()=>{
   const b=toWav(aBuf.getChannelData(0));
   const u=URL.createObjectURL(b);
   const a=document.createElement('a');a.href=u;a.download='sms.wav';a.click();
+  URL.revokeObjectURL(u);
+});
+
+$('sm').addEventListener('click',()=>{
+  if(!rendEvts)return;
+  const b=eventsToMidi(rendEvts,rendDur);
+  if(!b)return;
+  const u=URL.createObjectURL(b);
+  const a=document.createElement('a');a.href=u;a.download='sms.mid';a.click();
   URL.revokeObjectURL(u);
 });
 
